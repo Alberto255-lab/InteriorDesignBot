@@ -1,19 +1,14 @@
 """
 Bot Telegram - Modern Space Design (roleplay Minecraft)
-Python 3.10+  |  python-telegram-bot >= 21  |  google-genai
+Python 3.10+  |  python-telegram-bot >= 21
 """
-import asyncio
-import difflib
 import functools
-import io
 import logging
-import math
 import os
 import re
 import sqlite3
 import threading
 import time
-import urllib.error
 import urllib.request
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
@@ -29,7 +24,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.constants import ChatAction, ChatType, ParseMode
+from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -49,53 +44,21 @@ log = logging.getLogger("bot")
 
 # ───────────────────────── CONFIG ─────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-image")
-# Cloudflare Workers AI (gratis: 10.000 neurons/giorno ≈ 170 immagini FLUX schnell)
-CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
-CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
-CF_MODEL = os.getenv("CF_MODEL", "@cf/black-forest-labs/flux-1-schnell")
-CF_STEPS = int(os.getenv("CF_STEPS", "6"))
 CEO_ID = int(os.getenv("CEO_ID", "0"))
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-MAX_FLOORS = int(os.getenv("MAX_FLOORS", "4"))  # 1 immagine per piano
 BASE_DIR = Path(__file__).parent
 HIERARCHY_IMG = BASE_DIR / "gerarchia.png"
 
-# ───────────────────────── RUOLI ─────────────────────────
-ROLES = [
-    "CEO",
-    "Engineering Manager",
-    "Sales Manager",
-    "Logistic Manager",
-    "Academy Manager",
-    "Tecnico Cantiere",
-    "Progettista Base",
-    "Consulente Cliente",
-    "Marketing Specialist",
-    "Coordinatore Materiali",
-    "Istruttore Design",
-]
-ENGINEERING_ROLES = {"Engineering Manager", "Tecnico Cantiere", "Progettista Base"}
+# Ruoli di default (non eliminabili)
+DEFAULT_ROLES = ["CEO", "Vice CEO", "Engineering Manager", "Sales Manager",
+                 "Logistic Manager", "Academy Manager"]
+# Ruoli che hanno accesso Direzione
+DIRECTION_ROLES = {"CEO", "Vice CEO"}
 
 
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
-
-
-_ROLE_MAP = {_norm(r): r for r in ROLES}
-_ROLE_MAP.update({"engeneeringmanager": "Engineering Manager",
-                  "marcetingspecialist": "Marketing Specialist",
-                  "marketingspecialist": "Marketing Specialist"})
-
-
-def match_role(text: str):
-    key = _norm(text)
-    if key in _ROLE_MAP:
-        return _ROLE_MAP[key]
-    close = difflib.get_close_matches(key, list(_ROLE_MAP), n=1, cutoff=0.78)
-    return _ROLE_MAP[close[0]] if close else None
 
 
 # ───────────────────────── DATABASE ─────────────────────────
@@ -149,8 +112,14 @@ def init_db():
                     user_id INTEGER, nickname TEXT,
                     start TEXT, end TEXT, reason TEXT,
                     status TEXT DEFAULT 'pending');
+                CREATE TABLE IF NOT EXISTS roles(
+                    name TEXT PRIMARY KEY COLLATE NOCASE,
+                    is_default INTEGER NOT NULL DEFAULT 0);
                 """
             )
+            # Inserisci i ruoli di default se non presenti
+            for r in DEFAULT_ROLES:
+                c.execute("INSERT OR IGNORE INTO roles(name, is_default) VALUES(?,1)", (r,))
 
 
 def get_setting(key):
@@ -163,9 +132,45 @@ def set_setting(key, value):
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
 
 
+# ───────────────────────── RUOLI DINAMICI ─────────────────────────
+def get_all_roles() -> list[str]:
+    return [r["name"] for r in fetch("SELECT name FROM roles ORDER BY is_default DESC, name")]
+
+
+_ROLE_CACHE: dict = {}
+_ROLE_CACHE_TS = 0.0
+
+
+def _refresh_role_cache():
+    global _ROLE_CACHE, _ROLE_CACHE_TS
+    if time.time() - _ROLE_CACHE_TS > 10:
+        _ROLE_CACHE = {_norm(r): r for r in get_all_roles()}
+        _ROLE_CACHE_TS = time.time()
+
+
+def match_role(text: str):
+    import difflib
+    _refresh_role_cache()
+    key = _norm(text)
+    if key in _ROLE_CACHE:
+        return _ROLE_CACHE[key]
+    close = difflib.get_close_matches(key, list(_ROLE_CACHE), n=1, cutoff=0.78)
+    return _ROLE_CACHE[close[0]] if close else None
+
+
+def role_exists(name: str) -> bool:
+    return fetch1("SELECT 1 FROM roles WHERE name=? COLLATE NOCASE", (name,)) is not None
+
+
 # ───────────────────────── UTILS ─────────────────────────
 def is_direzione(user_id: int) -> bool:
-    return user_id == CEO_ID or user_id in ADMIN_IDS
+    if user_id == CEO_ID or user_id in ADMIN_IDS:
+        return True
+    # Controlla se l'utente ha un ruolo Direzione
+    emp = fetch1("SELECT role FROM employees WHERE user_id=?", (user_id,))
+    if emp and emp["role"] in DIRECTION_ROLES:
+        return True
+    return False
 
 
 def direzione_only(fn):
@@ -183,7 +188,6 @@ def mention(u) -> str:
 
 
 async def remember_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Salva id/username di chi scrive nei gruppi (serve a risolvere @username)."""
     u = update.effective_user
     if not u or u.is_bot:
         return
@@ -207,7 +211,6 @@ def lookup_username(username: str):
 
 
 async def resolve_target(update: Update, args: list):
-    """Ritorna (user_id, label, args_rimanenti) oppure None (e avvisa)."""
     msg = update.effective_message
     if msg.reply_to_message and msg.reply_to_message.from_user:
         u = msg.reply_to_message.from_user
@@ -243,7 +246,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await remember_user(update, context)
     emp = get_employee_for(u)
     nickname = emp["nickname"] if emp else u.full_name
-    role = emp["role"] if emp else ("Direzione" if is_direzione(u.id) else "Nessuno (non assunto)")
+    if emp:
+        role = emp["role"]
+    elif is_direzione(u.id):
+        role = "Direzione"
+    else:
+        role = "Nessuno (non assunto)"
     uname = f"@{u.username}" if u.username else "—"
     text = (
         "👋 <b>Il tuo profilo</b>\n\n"
@@ -253,7 +261,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💼 Ruolo: <b>{escape(role)}</b>"
     )
     kb = None
-    if emp:
+    if emp or is_direzione(u.id):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("📝 Richiedi Congedo", callback_data="congedo")]])
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -273,6 +281,55 @@ async def cmd_gerarchia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_setting("hierarchy_file_id", sent.photo[-1].file_id)
 
 
+# ───────────────────────── RUOLI ─────────────────────────
+@direzione_only
+async def cmd_ruolo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    args = context.args
+    if len(args) < 1:
+        roles = get_all_roles()
+        await msg.reply_text(
+            "Uso:\n"
+            "• /ruolo crea [nome ruolo]\n"
+            "• /ruolo delete [nome ruolo]\n"
+            "• /ruolo lista\n\n"
+            "📋 Ruoli attuali:\n• " + "\n• ".join(roles),
+            parse_mode=ParseMode.HTML)
+        return
+    action = args[0].lower()
+    if action == "lista":
+        roles = get_all_roles()
+        await msg.reply_text("📋 Ruoli attuali:\n• " + "\n• ".join(roles),
+                             parse_mode=ParseMode.HTML)
+        return
+    if len(args) < 2:
+        await msg.reply_text("❌ Specifica il nome del ruolo.")
+        return
+    name = " ".join(args[1:]).strip()
+    if not (2 <= len(name) <= 40):
+        await msg.reply_text("❌ Il nome deve essere tra 2 e 40 caratteri.")
+        return
+    if action == "crea":
+        if role_exists(name):
+            await msg.reply_text(f"⚠️ Il ruolo <b>{escape(name)}</b> esiste già.", parse_mode=ParseMode.HTML)
+            return
+        execute("INSERT INTO roles(name,is_default) VALUES(?,0)", (name,))
+        await msg.reply_text(f"✅ Ruolo <b>{escape(name)}</b> creato.", parse_mode=ParseMode.HTML)
+    elif action == "delete":
+        row = fetch1("SELECT * FROM roles WHERE name=? COLLATE NOCASE", (name,))
+        if not row:
+            await msg.reply_text(f"❌ Il ruolo <b>{escape(name)}</b> non esiste.", parse_mode=ParseMode.HTML)
+            return
+        if row["is_default"]:
+            await msg.reply_text(f"⛔ Il ruolo <b>{escape(row['name'])}</b> è di default e non può essere eliminato.",
+                                 parse_mode=ParseMode.HTML)
+            return
+        execute("DELETE FROM roles WHERE name=?", (row["name"],))
+        await msg.reply_text(f"🗑️ Ruolo <b>{escape(row['name'])}</b> eliminato.", parse_mode=ParseMode.HTML)
+    else:
+        await msg.reply_text("❌ Azione non valida. Usa `crea` o `delete`.", parse_mode=ParseMode.MARKDOWN)
+
+
 # ───────────────────────── ASSUNZIONI ─────────────────────────
 _ASSUMI_RE = re.compile(r"^(.+?)\s+@(\w{3,})\s+(.+)$", re.S)
 
@@ -289,7 +346,7 @@ async def cmd_assumi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nickname, username, role_txt = m.group(1).strip(), m.group(2), m.group(3).strip()
     role = match_role(role_txt)
     if not role:
-        await msg.reply_text("❌ Ruolo non valido. Ruoli disponibili:\n• " + "\n• ".join(ROLES))
+        await msg.reply_text("❌ Ruolo non valido. Ruoli disponibili:\n• " + "\n• ".join(get_all_roles()))
         return
     if fetch1("SELECT 1 FROM employees WHERE nickname=?", (nickname,)):
         await msg.reply_text("⚠️ Esiste già un dipendente con questo nickname.")
@@ -298,13 +355,13 @@ async def cmd_assumi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     execute("INSERT INTO employees(nickname,username,user_id,role) VALUES(?,?,?,?)",
             (nickname, username, uid, role))
     await msg.reply_text(f"✅ <b>{escape(nickname)}</b> (@{escape(username)}) assunto come "
-                         f"<b>{role}</b>.", parse_mode=ParseMode.HTML)
+                         f"<b>{escape(role)}</b>.", parse_mode=ParseMode.HTML)
     dip = get_setting("dipendenti_chat")
     if dip:
         try:
             await context.bot.send_message(
                 int(dip), f"🎉 Diamo il benvenuto a <b>{escape(nickname)}</b> (@{escape(username)}) "
-                          f"in qualità di <b>{role}</b>!", parse_mode=ParseMode.HTML)
+                          f"in qualità di <b>{escape(role)}</b>!", parse_mode=ParseMode.HTML)
         except TelegramError:
             pass
 
@@ -321,8 +378,56 @@ async def cmd_licenzia(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ Nessun dipendente con questo nickname.")
         return
     execute("DELETE FROM employees WHERE nickname=?", (nickname,))
-    await msg.reply_text(f"🗑️ <b>{escape(row['nickname'])}</b> ({row['role']}) è stato licenziato.",
+    await msg.reply_text(f"🗑️ <b>{escape(row['nickname'])}</b> ({escape(row['role'])}) è stato licenziato.",
                          parse_mode=ParseMode.HTML)
+
+
+# ───────────────────────── PROMOZIONE / DEGRADAZIONE ─────────────────────────
+@direzione_only
+async def cmd_pex(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if len(context.args) < 2:
+        await msg.reply_text("Uso: /pex [nickname] [nuovo ruolo]\n"
+                             "Es: /pex Marco Tecnico Cantiere\n"
+                             "Ruoli disponibili:\n• " + "\n• ".join(get_all_roles()))
+        return
+    # Prova prima a matchare il ruolo completo (ultime parole), poi il nickname
+    # Prendiamo: il primo argomento potrebbe essere parte del nickname; proviamo
+    # con l'intero testo dopo il primo token come ruolo.
+    role_txt = " ".join(context.args[1:]).strip()
+    role = match_role(role_txt)
+    nickname = context.args[0]
+    if not role:
+        # Forse il nickname è composto da più parole: prova a far combaciare il ruolo
+        # a partire dagli ultimi token
+        role = None
+        for split in range(1, len(context.args)):
+            cand_nick = " ".join(context.args[:split])
+            cand_role = " ".join(context.args[split:])
+            r = match_role(cand_role)
+            if r and fetch1("SELECT 1 FROM employees WHERE nickname=?", (cand_nick,)):
+                role = r
+                nickname = cand_nick
+                break
+    if not role:
+        await msg.reply_text("❌ Ruolo non valido. Ruoli disponibili:\n• " + "\n• ".join(get_all_roles()))
+        return
+    row = fetch1("SELECT * FROM employees WHERE nickname=?", (nickname,))
+    if not row:
+        await msg.reply_text(f"❌ Nessun dipendente con nickname <b>{escape(nickname)}</b>.",
+                             parse_mode=ParseMode.HTML)
+        return
+    old = row["role"]
+    if old == role:
+        await msg.reply_text(f"ℹ️ <b>{escape(nickname)}</b> ha già il ruolo <b>{escape(role)}</b>.",
+                             parse_mode=ParseMode.HTML)
+        return
+    execute("UPDATE employees SET role=? WHERE nickname=?", (role, nickname))
+    arrow = "⬆️" if old not in DIRECTION_ROLES and role in DIRECTION_ROLES else "🔄"
+    await msg.reply_text(
+        f"{arrow} <b>{escape(nickname)}</b>:\n"
+        f"<s>{escape(old)}</s> → <b>{escape(role)}</b>",
+        parse_mode=ParseMode.HTML)
 
 
 # ───────────────────────── CHAT / CANALI ─────────────────────────
@@ -348,9 +453,6 @@ async def cmd_setdirezione(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @direzione_only
 async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setchannel nome            -> salva la chat corrente
-       /setchannel nome @canale    -> salva un canale pubblico (il bot deve esserne admin)
-       /setchannel nome -100123..  -> salva tramite id"""
     msg = update.effective_message
     if not context.args:
         await msg.reply_text("Uso: /setchannel [nomecanale] [@canale o id (facoltativo)]")
@@ -432,13 +534,28 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @direzione_only
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg, chat = update.effective_message, update.effective_chat
+    if chat.type == ChatType.PRIVATE:
+        await msg.reply_text("Usalo in un gruppo.")
+        return
     res = await resolve_target(update, context.args)
     if not res:
         return
     uid, label, _ = res
     try:
-        await context.bot.unban_chat_member(chat.id, uid, only_if_banned=True)
+        await context.bot.unban_chat_member(chat.id, uid)
     except TelegramError as e:
+        # Se l'errore è "user not found" proviamo comunque a ripristinare i permessi
+        err = (e.message or "").lower()
+        if "not found" in err or "participant" in err:
+            try:
+                c = await context.bot.get_chat(chat.id)
+                perms = c.permissions or ChatPermissions.all_permissions()
+                await context.bot.restrict_chat_member(chat.id, uid, perms)
+                await msg.reply_text(f"✅ {label} può di nuovo entrare e scrivere.")
+                return
+            except TelegramError as e2:
+                await msg.reply_text(f"❌ Impossibile sbannare: {e2.message}")
+                return
         await msg.reply_text(f"❌ Impossibile sbannare: {e.message}")
         return
     await msg.reply_text(f"✅ {label} è stato sbannato.")
@@ -460,7 +577,7 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     until, dur_txt = None, "a tempo indeterminato"
     if rest and (m := _DUR_RE.match(rest[0])):
         n, unit = int(m.group(1)), m.group(2).lower()
-        secs = max(30, n * {"s": 1, "m": 60, "h": 3600}[unit])  # <30s = per sempre su Telegram
+        secs = max(30, n * {"s": 1, "m": 60, "h": 3600}[unit])
         until = datetime.now(timezone.utc) + timedelta(seconds=secs)
         dur_txt = f"per {m.group(1)}{unit}" + (" (minimo 30s)" if n * {"s": 1, "m": 60, "h": 3600}[unit] < 30 else "")
         rest = rest[1:]
@@ -494,9 +611,9 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ───────────────────────── PERSONAL ─────────────────────────
 BUILTIN = {
-    "start", "assumi", "licenzia", "gerarchia", "piantina", "setdipendenti", "setdirezione",
+    "start", "assumi", "licenzia", "gerarchia", "setdipendenti", "setdirezione",
     "setchannel", "inoltra", "ban", "unban", "mute", "unmute", "personal", "unpersonal",
-    "congedi", "annulla", "salta",
+    "congedi", "annulla", "salta", "ruolo", "pex",
 }
 
 
@@ -590,7 +707,7 @@ def parse_date(s: str):
 async def congedo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     emp = get_employee_for(q.from_user)
-    if not emp:
+    if not emp and not is_direzione(q.from_user.id):
         await q.answer("Non risulti assunto.", show_alert=True)
         return ConversationHandler.END
     await q.answer()
@@ -645,7 +762,7 @@ async def congedo_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📝 <b>Nuova richiesta di congedo</b>\n\n"
         f"👤 {escape(data['nick'])} ({escape(mention(u))})\n"
-        f"💼 {escape(emp['role']) if emp else '—'}\n"
+        f"💼 {escape(emp['role']) if emp else 'Direzione'}\n"
         f"📅 Dal <b>{data['start']:%d/%m/%Y}</b> al <b>{data['end']:%d/%m/%Y}</b>\n"
         f"✏️ Motivo: {escape(data['reason'])}"
     )
@@ -715,398 +832,12 @@ async def cmd_congedi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("\n\n".join(parts), parse_mode=ParseMode.HTML)
 
 
-# ───────────────────────── PIANTINA ─────────────────────────
-P_PHOTO, P_SIZE, P_FLOORS, P_FURN, P_NOTES, P_POS = range(6)
-
-# Posizioni: (callback key, etichetta IT, descrizione EN per il prompt). Nord = alto dell'immagine.
-POSITIONS = [
-    ("NO", "↖️ Nord Ovest", "north-west (top-left) corner area"),
-    ("N", "⬆️ Nord", "north (top) side, middle"),
-    ("NE", "↗️ Nord Est", "north-east (top-right) corner area"),
-    ("O", "⬅️ Ovest", "west (left) side, middle"),
-    ("C", "⏺️ Centro", "center"),
-    ("E", "➡️ Est", "east (right) side, middle"),
-    ("SO", "↙️ Sud Ovest", "south-west (bottom-left) corner area"),
-    ("S", "⬇️ Sud", "south (bottom) side, middle"),
-    ("SE", "↘️ Sud Est", "south-east (bottom-right) corner area"),
-]
-POS_BY_KEY = {k: (it, en) for k, it, en in POSITIONS}
-
-EMOJI_TABLE = [
-    (("letto", "branda"), "🛏️"), (("divano", "poltrona"), "🛋️"),
-    (("tavolo", "tavolino"), "🍽️"), (("sedia", "sgabello"), "🪑"),
-    (("cucina", "fornelli", "piano cottura", "forno"), "🍳"), (("frigo",), "🧊"),
-    (("bagno", "wc", "water"), "🚽"), (("doccia",), "🚿"), (("vasca",), "🛁"),
-    (("lavandino", "lavabo"), "🚰"), (("tv", "televisore"), "📺"),
-    (("pc", "computer", "scrivania", "postazione"), "💻"), (("armadio", "guardaroba"), "🗄️"),
-    (("libreria", "scaffal"), "📚"), (("pianta", "vaso"), "🪴"), (("lampada", "luce"), "💡"),
-    (("camino",), "🔥"), (("specchio",), "🪞"), (("scala",), "🪜"), (("piscina",), "🏊"),
-    (("auto", "garage", "macchina"), "🚗"), (("bancone", "cassa", "reception"), "🧾"),
-    (("pianoforte",), "🎹"), (("quadro",), "🖼️"), (("jukebox", "musica"), "🎵"),
-    (("baule", "chest"), "📦"),
-]
-
-
-def emoji_for(name: str) -> str:
-    t = name.lower()
-    for keys, emo in EMOJI_TABLE:
-        if any(k in t for k in keys):
-            return emo
-    return "📦"
-
-
-def parse_size(text: str):
-    """-> (w, h, area, approx) oppure None"""
-    t = text.lower()
-    nums = [float(n.replace(",", ".")) for n in re.findall(r"\d+(?:[.,]\d+)?", t)]
-    if not nums:
-        return None
-    if len(nums) >= 2 and re.search(r"\d\s*(?:[x×*]|per)\s*\d", t) and not re.search(r"m\s*[²2]|mq|quadr", t):
-        w, h = round(nums[0]), round(nums[1])
-        approx = False
-    else:
-        area = nums[0]
-        w = max(1, round(math.sqrt(area * 4 / 3)))
-        h = max(1, round(area / w))
-        approx = True
-    area = w * h
-    if w < 3 or h < 3 or w > 200 or h > 200:
-        return None
-    return w, h, area, approx
-
-
-async def piantina_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != ChatType.PRIVATE:
-        await update.effective_message.reply_text("📩 Usa /piantina in privato con me.")
-        return ConversationHandler.END
-    emp = get_employee_for(update.effective_user)
-    if not is_direzione(update.effective_user.id) and (not emp or emp["role"] not in ENGINEERING_ROLES):
-        await update.effective_message.reply_text("⛔ Comando riservato a Engineering e Direzione.")
-        return ConversationHandler.END
-    context.user_data["plan"] = {"furn": []}
-    await update.effective_message.reply_text(
-        "🏗️ <b>Nuova piantina</b> (/annulla per uscire)\n\n"
-        "📸 <b>Hai una foto della struttura?</b> Inviamela (come foto) e la userò per capire "
-        "più o meno com'è fatta.\nFacoltativo: /salta per saltare.",
-        parse_mode=ParseMode.HTML)
-    return P_PHOTO
-
-
-async def _ask_size(update: Update):
-    await update.effective_chat.send_message(
-        "📐 <b>Quanto è grande l'edificio?</b> (per piano, 1 blocco = 1 metro)\n"
-        "Scrivi le dimensioni in blocchi, es. <code>20x15</code>, oppure i m², es. <code>300 m2</code>.",
-        parse_mode=ParseMode.HTML)
-    return P_SIZE
-
-
-async def piantina_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sizes = update.message.photo or []
-    doc = update.message.document
-    try:
-        if sizes:
-            # evita foto enormi: la più grande con larghezza <= 800, altrimenti la più piccola
-            small = [p for p in sizes if p.width <= 800]
-            pick = small[-1] if small else sizes[0]
-            tg_file = await pick.get_file()
-        elif doc and (doc.mime_type or "").startswith("image/") and (doc.file_size or 0) < 5_000_000:
-            tg_file = await doc.get_file()
-        else:
-            await update.message.reply_text("❌ Non è una foto. Inviala come immagine oppure /salta.")
-            return P_PHOTO
-        context.user_data["plan"]["photo"] = bytes(await tg_file.download_as_bytearray())
-    except TelegramError as e:
-        await update.message.reply_text(f"❌ Non riesco a scaricare la foto ({e.message}). Riprova o /salta.")
-        return P_PHOTO
-    await update.message.reply_text("✅ Foto ricevuta.")
-    return await _ask_size(update)
-
-
-async def piantina_photo_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📸 Inviami una foto oppure scrivi /salta per continuare senza.")
-    return P_PHOTO
-
-
-async def piantina_photo_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await _ask_size(update)
-
-
-async def piantina_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parsed = parse_size(update.message.text)
-    if not parsed:
-        await update.message.reply_text("❌ Non ho capito (min 3, max 200 blocchi per lato). "
-                                        "Esempi: <code>20x15</code> o <code>300 m2</code>",
-                                        parse_mode=ParseMode.HTML)
-        return P_SIZE
-    w, h, area, approx = parsed
-    plan = context.user_data["plan"]
-    plan.update(w=w, h=h, area=area, approx=approx)
-    extra = f" (forma stimata, circa {w}x{h})" if approx else ""
-    await update.message.reply_text(f"✅ {w}×{h} blocchi = {area} m² per piano{extra}.\n\n"
-                                    f"🏢 <b>Quanti piani</b> ha l'edificio? (max {MAX_FLOORS})",
-                                    parse_mode=ParseMode.HTML)
-    return P_FLOORS
-
-
-async def piantina_floors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if not t.isdigit() or not (1 <= int(t) <= MAX_FLOORS):
-        await update.message.reply_text(f"❌ Inserisci un numero da 1 a {MAX_FLOORS}.")
-        return P_FLOORS
-    context.user_data["plan"]["floors"] = int(t)
-    await update.message.reply_text(
-        "🪑 <b>Elenca le forniture</b> (separate da virgola o a capo), es: <i>letto, divano, cucina, bagno</i>\n"
-        "Facoltativo: /salta per saltare.", parse_mode=ParseMode.HTML)
-    return P_FURN
-
-
-async def piantina_furn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    items = [x.strip() for x in re.split(r"[,\n;]+", update.message.text) if x.strip()][:20]
-    context.user_data["plan"]["furn"] = [{"name": i, "emoji": emoji_for(i)} for i in items]
-    return await _ask_notes(update)
-
-
-async def piantina_furn_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await _ask_notes(update)
-
-
-async def _ask_notes(update: Update):
-    await update.message.reply_text("📝 <b>Note aggiuntive?</b> (stile, stanze desiderate, ecc.)\n"
-                                    "Facoltativo: /salta per saltare.", parse_mode=ParseMode.HTML)
-    return P_NOTES
-
-
-async def piantina_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["plan"]["notes"] = update.message.text.strip()
-    return await _begin_positions(update, context)
-
-
-async def piantina_notes_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["plan"]["notes"] = ""
-    return await _begin_positions(update, context)
-
-
-async def _begin_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    plan = context.user_data["plan"]
-    if not plan["furn"]:
-        return await _generate(update, context)
-    plan["idx"] = 0
-    return await _ask_position(update, plan)
-
-
-async def _ask_position(update: Update, plan):
-    """Mostra i tasti: prima il piano (se più di uno), poi la posizione."""
-    f = plan["furn"][plan["idx"]]
-    chat = update.effective_chat
-    head = f"📍 [{plan['idx'] + 1}/{len(plan['furn'])}] {f['emoji']} <b>{escape(f['name'])}</b>"
-    if plan["floors"] > 1 and "cur_floor" not in plan:
-        rows, row = [], []
-        for n in range(1, plan["floors"] + 1):
-            row.append(InlineKeyboardButton("Piano terra" if n == 1 else f"Piano {n}", callback_data=f"pp:f:{n}"))
-            if len(row) == 2:
-                rows.append(row)
-                row = []
-        if row:
-            rows.append(row)
-        await chat.send_message(f"{head}\nIn che <b>piano</b> si trova?", parse_mode=ParseMode.HTML,
-                                reply_markup=InlineKeyboardMarkup(rows))
-        return P_POS
-    grid = [[InlineKeyboardButton(it, callback_data=f"pp:p:{k}") for k, it, _ in POSITIONS[i:i + 3]]
-            for i in range(0, 9, 3)]
-    await chat.send_message(f"{head}\nIn che <b>posizione</b> si trova? (Nord = in alto nella piantina)",
-                            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(grid))
-    return P_POS
-
-
-async def piantina_pos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    plan = context.user_data.get("plan")
-    if not plan or "idx" not in plan:
-        await q.answer("Sessione scaduta, rilancia /piantina.", show_alert=True)
-        return ConversationHandler.END
-    _, kind, val = q.data.split(":")
-    await q.answer()
-    if kind == "f":
-        plan["cur_floor"] = int(val)
-        await q.edit_message_text(f"🏢 Piano selezionato: {'terra' if val == '1' else val}")
-        return await _ask_position(update, plan)
-    label_it, _ = POS_BY_KEY[val]
-    f = plan["furn"][plan["idx"]]
-    f["floor"] = plan.pop("cur_floor", 1)
-    f["pos"] = label_it.split(" ", 1)[1]
-    f["pos_en"] = POS_BY_KEY[val][1]
-    await q.edit_message_text(f"✅ {f['emoji']} {f['name']} → {f['pos']}"
-                              + (f" (piano {f['floor']})" if plan["floors"] > 1 else ""))
-    plan["idx"] += 1
-    if plan["idx"] < len(plan["furn"]):
-        return await _ask_position(update, plan)
-    return await _generate(update, context)
-
-
-def build_prompt(plan: dict, floor: int) -> str:
-    w, h = plan["w"], plan["h"]
-    approx = "approximately " if plan.get("approx") else ""
-    lines = [
-        f"A clean, professional top-down 2D architectural floor plan (blueprint style) of floor "
-        f"{floor} of {plan['floors']} of a building.",
-        f"Footprint: {approx}{w} m x {h} m ({w * h} m²), drawn to scale on a visible square grid "
-        "where ONE grid square = 1 meter = 1 Minecraft block. Add a scale bar (0-5-10 m) and "
-        "overall dimension lines.",
-        "Thick black walls, doors as arcs, windows as thin double lines, room names written in Italian, "
-        "white background, strictly orthographic top view, no 3D, no perspective, no people.",
-    ]
-    if plan["floors"] > 1:
-        lines.append("Include a staircase in a consistent position on every floor.")
-    items = [f for f in plan["furn"] if f.get("floor") == floor]
-    if items:
-        lines.append("Mark each of these furnishings with a clear RED DOT at its exact position, "
-                     "with a small emoji icon next to the dot, and add a legend:")
-        lines.append("North is the TOP of the image (add a small compass arrow).")
-        lines += [f"- {f['emoji']} {f['name']}: {f.get('pos_en') or f['pos']}" for f in items]
-    if plan.get("notes"):
-        lines.append(f"Additional notes: {plan['notes']}")
-    if plan.get("photo_desc"):
-        lines.append(f"Reference: the real structure looks like this, take inspiration for the layout "
-                     f"and shape: {plan['photo_desc']}")
-    return "\n".join(lines)
-
-
-_client = None
-
-
-def _gen_image_cloudflare(prompt: str) -> bytes:
-    import base64
-    import json
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_MODEL}"
-    body = json.dumps({"prompt": prompt[:2000], "steps": CF_STEPS}).encode()
-    req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Cloudflare HTTP {e.code}: {e.read()[:200].decode(errors='ignore')}")
-    img = (data.get("result") or {}).get("image")
-    if not img:
-        raise RuntimeError(f"Cloudflare non ha restituito immagini: {str(data.get('errors'))[:200]}")
-    return base64.b64decode(img)
-
-
-def _gen_image_gemini(prompt: str) -> bytes:
-    global _client
-    from google import genai
-    if _client is None:
-        _client = genai.Client(api_key=GEMINI_API_KEY)
-    resp = _client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-    for cand in resp.candidates or []:
-        for part in (cand.content.parts if cand.content else []) or []:
-            if getattr(part, "inline_data", None) and part.inline_data.data:
-                return part.inline_data.data
-    raise RuntimeError("Gemini non ha restituito alcuna immagine.")
-
-
-_VISION_PROMPT = ("Describe this building for an architect drawing its floor plan: overall shape, "
-                  "approximate proportions, number of floors, entrances, windows, rooms or sections, "
-                  "notable features. Max 80 words, plain English.")
-
-
-def _describe_photo_sync(img: bytes) -> str:
-    """Descrive la foto con un modello vision (Cloudflare llava, ripiego Gemini). '' se fallisce."""
-    import json
-    if CF_ACCOUNT_ID and CF_API_TOKEN:
-        try:
-            url = (f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/"
-                   "@cf/llava-hf/llava-1.5-7b-hf")
-            body = json.dumps({"image": list(img), "prompt": _VISION_PROMPT, "max_tokens": 200}).encode()
-            req = urllib.request.Request(url, data=body, method="POST", headers={
-                "Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=90) as r:
-                res = json.loads(r.read()).get("result") or {}
-            text = (res.get("description") or res.get("response") or "").strip()
-            if text:
-                return text
-        except Exception as e:
-            log.warning("Vision Cloudflare fallita: %s", e)
-    if GEMINI_API_KEY:
-        try:
-            from google import genai
-            from google.genai import types
-            global _client
-            if _client is None:
-                _client = genai.Client(api_key=GEMINI_API_KEY)
-            resp = _client.models.generate_content(
-                model=os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash"),
-                contents=[types.Part.from_bytes(data=img, mime_type="image/jpeg"), _VISION_PROMPT])
-            return (resp.text or "").strip()
-        except Exception as e:
-            log.warning("Vision Gemini fallita: %s", e)
-    return ""
-
-
-def image_backend_available() -> bool:
-    return bool((CF_ACCOUNT_ID and CF_API_TOKEN) or GEMINI_API_KEY)
-
-
-def _gen_image_sync(prompt: str) -> bytes:
-    """Prova Cloudflare (gratis, limiti larghi); se fallisce ripiega su Gemini se configurato."""
-    errors = []
-    if CF_ACCOUNT_ID and CF_API_TOKEN:
-        try:
-            return _gen_image_cloudflare(prompt)
-        except Exception as e:
-            log.warning("Cloudflare fallito: %s", e)
-            errors.append(str(e))
-    if GEMINI_API_KEY:
-        try:
-            return _gen_image_gemini(prompt)
-        except Exception as e:
-            errors.append(f"Gemini: {e}")
-    raise RuntimeError(" | ".join(errors) or "Nessun provider immagini configurato.")
-
-
-async def _generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    plan = context.user_data.pop("plan")
-    chat = update.effective_chat
-    if not image_backend_available():
-        await chat.send_message("⚠️ Nessun provider immagini configurato (CF_ACCOUNT_ID + CF_API_TOKEN).")
-        return ConversationHandler.END
-    await chat.send_message(f"🎨 Genero {plan['floors']} piantina/e... ci vuole qualche secondo.")
-    if plan.get("photo"):
-        await chat.send_chat_action(ChatAction.TYPING)
-        plan["photo_desc"] = await asyncio.to_thread(_describe_photo_sync, plan.pop("photo"))
-        if not plan["photo_desc"]:
-            await chat.send_message("⚠️ Non sono riuscito ad analizzare la foto, procedo senza.")
-    for floor in range(1, plan["floors"] + 1):
-        await chat.send_chat_action(ChatAction.UPLOAD_PHOTO)
-        try:
-            img = await asyncio.to_thread(_gen_image_sync, build_prompt(plan, floor))
-        except Exception as e:  # quota, safety, rete...
-            log.exception("Image generation error")
-            await chat.send_message(f"❌ Errore nella generazione del piano {floor}: {str(e)[:300]}")
-            continue
-        legend = [f"{f['emoji']} {f['name']} — {f['pos']}" for f in plan["furn"] if f.get("floor") == floor]
-        caption = (f"🏢 Piano {floor}/{plan['floors']} — {plan['w']}×{plan['h']} blocchi "
-                   f"({plan['area']} m²)\n📏 Scala: 1 blocco = 1 m")
-        if legend:
-            caption += "\n\n" + "\n".join(legend)
-        await chat.send_photo(io.BytesIO(img), caption=caption[:1024])
-    return ConversationHandler.END
-
-
-async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("plan", None)
-    context.user_data.pop("leave", None)
-    await update.effective_message.reply_text("🚫 Operazione annullata.")
-    return ConversationHandler.END
-
-
 # ───────────────────────── KEEP-ALIVE (Render) ─────────────────────────
 HEARTBEAT_FILE = BASE_DIR / "heartbeat.txt"
 PORT = int(os.getenv("PORT", "10000"))
 
 
 def start_keepalive():
-    """Avvia 3 thread: server HTTP (richiesto da Render), heartbeat su .txt, self-ping."""
     state = {"n": 0}
 
     class Handler(BaseHTTPRequestHandler):
@@ -1131,7 +862,7 @@ def start_keepalive():
     def serve():
         HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
-    def heartbeat():  # ogni 15s scrive un numero crescente in heartbeat.txt
+    def heartbeat():
         while True:
             state["n"] += 1
             try:
@@ -1140,7 +871,7 @@ def start_keepalive():
                 log.warning("heartbeat: %s", e)
             time.sleep(15)
 
-    def self_ping():  # ogni 10 min richiama il proprio URL pubblico
+    def self_ping():
         url = os.getenv("RENDER_EXTERNAL_URL")
         if not url:
             return
@@ -1161,7 +892,6 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Il tuo profilo"),
         BotCommand("gerarchia", "Mostra l'organigramma"),
-        BotCommand("piantina", "Genera una piantina 2D (Engineering)"),
     ])
 
 
@@ -1171,24 +901,8 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     text = filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE
 
-    # tracciamento utenti dei gruppi (gruppo -1 => non blocca gli altri handler)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, remember_user), group=-1)
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("piantina", piantina_start)],
-        states={
-            P_PHOTO: [CommandHandler("salta", piantina_photo_skip),
-                      MessageHandler((filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE,
-                                     piantina_photo),
-                      MessageHandler(text, piantina_photo_text)],
-            P_SIZE: [MessageHandler(text, piantina_size)],
-            P_FLOORS: [MessageHandler(text, piantina_floors)],
-            P_FURN: [CommandHandler("salta", piantina_furn_skip), MessageHandler(text, piantina_furn)],
-            P_NOTES: [CommandHandler("salta", piantina_notes_skip), MessageHandler(text, piantina_notes)],
-            P_POS: [CallbackQueryHandler(piantina_pos, pattern=r"^pp:(f|p):\w+$")],
-        },
-        fallbacks=[CommandHandler("annulla", conv_cancel)],
-    ))
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(congedo_start, pattern="^congedo$")],
         states={
@@ -1207,14 +921,20 @@ def main():
         ("inoltra", cmd_inoltra), ("ban", cmd_ban), ("unban", cmd_unban),
         ("mute", cmd_mute), ("unmute", cmd_unmute), ("personal", cmd_personal),
         ("unpersonal", cmd_unpersonal), ("congedi", cmd_congedi),
+        ("ruolo", cmd_ruolo), ("pex", cmd_pex),
     ]:
         app.add_handler(CommandHandler(name, fn))
 
     app.add_handler(CallbackQueryHandler(leave_decision, pattern=r"^leave:(ok|no):\d+$"))
-    # ultimo: qualsiasi comando non riconosciuto => cerca tra i /personal
     app.add_handler(MessageHandler(filters.COMMAND, personal_dispatch))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("leave", None)
+    await update.effective_message.reply_text("🚫 Operazione annullata.")
+    return ConversationHandler.END
 
 
 if __name__ == "__main__":
