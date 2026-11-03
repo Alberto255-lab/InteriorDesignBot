@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: modern-space-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: BOT_TOKEN
+        sync: false
+      - key: CF_ACCOUNT_ID
+        sync: false
+      - key: CF_API_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CEO_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash-image
